@@ -1,36 +1,91 @@
 # How Claude Code Works
 
-> One of the earliest structured source code analyses of Claude Code — distilling the agent loop, tool system, and context engineering from the source
+> A deep dive into the source code architecture of the most successful AI coding agent
 
 [中文](./README.md)
 
-**Not reading notes — architectural abstractions.** This project distills 11 topic-specific documents + architecture diagrams from Claude Code's 500K+ lines of TypeScript source code, giving you the shortest path to understanding this production-grade coding agent.
+Claude Code is the most widely used AI coding agent today. It understands entire codebases, autonomously executes multi-step programming tasks, and safely runs commands — all powered by engineering wisdom distilled into **500K+ lines of TypeScript source code**.
 
-## Key Design Insights from Source Code
+Anthropic open-sourced this codebase. **But where do you even start with 500K lines of code?**
 
-> All observations below come from actual analysis of the 500K+ line codebase — not speculation.
+This project is the answer. We've distilled **11 topic-specific documents** covering every critical design decision, from the core agent loop to the security architecture. Whether you want to build your own AI agent or deeply understand how Claude Code works, this is the shortest path.
 
-### Architecture
-- **The entire system is built on `async function*` generators** — true token-level streaming from API to UI, not "get response then render"
-- **React for terminal UI is not overkill — it's necessary** — Full React Reconciler → Yoga Flexbox → Screen Buffer → Diff Detection → ANSI pipeline. Without this, complex interactions with 66+ tools would be impossible with string concatenation
+## Related Projects
 
-### Agent Loop
-- **The loop is a state machine with 7 distinct Continue reasons** — context compression retry, output budget escalation (4K→64K), hook verification loops, etc. Each path has independent recovery logic
-- **Recoverable errors are "withheld" — not exposed** — `prompt-too-long` and `max-output-tokens` are held internally while compression + retry is attempted. SDK clients never see errors that were recovered from
-- **Tools start executing while the model is still talking** — `StreamingToolExecutor` parses and pre-executes tool calls during the 5-30s streaming window, hiding ~1s of tool latency
+- **[claude-code-from-scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)** — A minimal implementation & step-by-step tutorial for building Claude Code's core features from scratch
 
-### Context Engineering
-- **Context compression is a 4-level graduated pipeline, not "compress when full"** — Snip → Microcompact (near-zero cost dedup) → Context Collapse (projection-based, doesn't modify original messages) → Autocompact (last resort, forks a sub-agent for summarization)
-- **After compression, the 5 most recently used files are automatically restored** — prevents the model from "forgetting" what it just edited. Budget: 5 files × 5K tokens + all activated skills (25K token budget)
+## Why is this source code worth studying?
 
-### Security
-- **Bash security uses tree-sitter AST analysis, not regex** — 7-layer pipeline including wrapper stripping, env var filtering, AST semantic analysis, 23 static validators (IFS injection, control char detection), sed-specific vulnerability checks
-- **Permission dialogs race 3 parallel paths** — UI confirmation, ML classifier auto-approval (~100ms), and Hook validation run simultaneously. First to complete wins, but with 200ms debounce protection against keyboard bounce
+Most AI agent frameworks are "demo-grade" — they work for one scenario and call it done. Claude Code is different. It's a **production system used daily by millions of developers**, tackling problems far more complex than any demo:
 
-### Engineering
-- **66+ tools don't all ship in every build** — Bun's `feature()` macro performs compile-time dead code elimination. Internal-only tools vanish entirely from external builds
-- **Fast startup via 9-phase parallel initialization** — MDM read and keychain prefetch start during module loading; non-critical tasks defer until after first render. Critical path: ~235ms
-- **API 529 retry distinguishes foreground vs background** — user-facing ops retry, background tasks (summaries, predictions) give up immediately to avoid amplifying gateway load
+- Conversations grow to tens of thousands of tokens — what happens when the context window runs out?
+- A user asks the AI to run `rm -rf /` — how do you stop it?
+- 66 built-in tools coexist — how do you coordinate them?
+- Network drops, API overloads, token limits hit — how do you avoid crashing?
+- How do you make it *feel* fast when model inference alone takes tens of seconds?
+
+The answers are all in the source code.
+
+## Key Designs from the Source Code
+
+> Everything below comes from actual source code analysis, not speculation.
+
+### Why does Claude Code feel so fast?
+
+It does three clever things:
+
+1. **End-to-end streaming** — Instead of waiting for the model to finish thinking, every token is displayed the instant it's generated. The entire pipeline from API call to terminal rendering is streaming.
+2. **Tool pre-execution** — When the model says "I need to read this file," that file is already being read. The system parses and executes tool calls while the model is still generating output, hiding ~1s of tool latency within the 5-30s model generation window.
+3. **9-phase parallel startup** — Independent initialization tasks run in parallel, compressing the critical path to ~235ms.
+
+### What happens when things go wrong? — Silent recovery
+
+Most programs show errors to users. Claude Code's strategy: **if an error is recoverable, the user never sees it.**
+
+When a conversation exceeds the context window, it doesn't pop up an error dialog — it silently compresses the context and retries. Hit the output token limit? It automatically escalates from 4K to 64K and tries again. The agent loop has 7 different "continue" strategies, each handling a different failure recovery path.
+
+This is why you rarely see errors in Claude Code — not because there aren't any, but because most are handled internally.
+
+### What about long conversations? — 4-level progressive compression
+
+One of the most elegant designs in the entire system. When context approaches its limit, instead of a blunt compression pass, it goes through 4 graduated levels:
+
+1. **Snip** — Truncate large content blocks (old tool outputs) from history
+2. **Deduplicate** — Remove duplicate content at near-zero cost
+3. **Collapse** — Fold inactive conversation segments without modifying originals (reversible)
+4. **Summarize** — Last resort: spawn a child agent to summarize the entire conversation
+
+Each level may free enough space that subsequent levels don't need to run. After compression, the system **automatically restores the 5 most recently edited files**, preventing the model from forgetting what it was just working on.
+
+### How do you prevent AI from executing dangerous operations? — 5 layers of defense
+
+Claude Code runs commands directly on your machine — security has to be rock-solid. It doesn't rely on a single "are you sure?" dialog. Instead, it builds 5 layers of defense:
+
+1. **Permission modes** — Different trust levels restricting what operations can run
+2. **Rule matching** — Pattern-based allowlists and denylists
+3. **Deep Bash analysis** — The most hardcore layer: uses syntax tree analysis (not regex) to dissect the true intent of shell commands, with 23 security checks covering command injection, environment variable leaks, special character attacks, and more
+4. **User confirmation** — Dangerous operations trigger a confirmation dialog with 200ms debounce protection against accidental key presses
+5. **Hook validation** — Users can define custom security rules that even modify tool inputs on the fly (e.g., automatically adding `--dry-run` to `rm` commands)
+
+If any single layer blocks the action, it doesn't execute. Defense in depth.
+
+### How do 66 tools work together?
+
+All tools — file reading, file writing, shell commands, search, even third-party MCP tools — follow **the same interface specification**. This means:
+
+- Third-party tools go through the exact same execution pipeline as built-in tools, getting identical security checks and permission controls
+- Read-only tools automatically run in parallel; write operations are serialized — no manual concurrency management needed
+- When tool output exceeds 100K characters, it's automatically saved to disk; the model gets a summary and file path, reading the full content on demand
+
+### How do multiple agents collaborate?
+
+Claude Code supports three multi-agent modes:
+
+- **Sub-agent** — The main agent dispatches tasks to child agents and waits for results
+- **Coordinator** — Pure commander mode: the coordinator can only assign tasks, **it cannot read files or write code itself**, enforcing division of labor
+- **Swarm** — Named agents communicate peer-to-peer, each working independently
+
+To prevent conflicts from multiple agents editing the same files, the system uses Git Worktrees to give each agent its own isolated copy of the codebase.
 
 ## System Architecture
 
@@ -68,19 +123,28 @@ graph TB
 
 ### Deep Dives
 
-| # | Document | Content | Keywords |
-|---|----------|---------|----------|
-| 1 | [Overview](./docs/01-overview.md) | Problem, tech stack, design principles, directory structure | Architecture |
-| 2 | [Agent Loop](./docs/02-agent-loop.md) | The core loop: dual-layer generators, streaming, stop conditions | **Most Important** |
-| 3 | [Context Engineering](./docs/03-context-engineering.md) | Context building, 4-level compression pipeline, token budget | Compression, Prompt |
-| 4 | [Tool System](./docs/04-tool-system.md) | 66+ tools, execution pipeline, concurrency, MCP integration | Tools, Extension |
-| 5 | [Code Editing Strategy](./docs/05-code-editing-strategy.md) | Search-replace vs full rewrite, low-destructiveness philosophy | Editing, Safety |
-| 6 | [Permission & Security](./docs/06-permission-security.md) | 5-layer defense, Bash AST analysis, injection prevention | Security, Permission |
-| 7 | [User Experience](./docs/07-user-experience.md) | Ink/React TUI, streaming output, Vim mode | UX, Terminal |
-| 8 | [Minimal Components](./docs/08-minimal-components.md) | Minimum viable coding agent, progressive enhancement | Build Your Own |
-| 9 | [Hooks & Extensibility](./docs/09-hooks-extensibility.md) | 23+ hook events, 5 hook types, PermissionRequest deep dive | Hooks, Customization |
-| 10 | [Multi-Agent Architecture](./docs/10-multi-agent.md) | Sub-agents, Coordinator mode, Swarm teams | Multi-Agent |
-| 11 | [Memory & Skills](./docs/11-memory-skills.md) | 4 memory types, 18+ built-in skills, cross-session learning | Memory, Skills |
+| # | Document | What you'll learn |
+|---|----------|-------------------|
+| 1 | [Overview](./docs/01-overview.md) | What problem Claude Code solves, the thinking behind tech choices, overall architecture |
+| 2 | [Agent Loop](./docs/02-agent-loop.md) | How the agent "think-act-observe" loop works, how it handles interruption and recovery |
+| 3 | [Context Engineering](./docs/03-context-engineering.md) | How to fit the most useful information into a limited context window, full compression strategy details |
+| 4 | [Tool System](./docs/04-tool-system.md) | How 66 tools are registered, dispatched, and concurrency-controlled; how to integrate third-party tools |
+| 5 | [Code Editing Strategy](./docs/05-code-editing-strategy.md) | Why "search-and-replace" over "full file rewrite," how to ensure edit safety |
+| 6 | [Permission & Security](./docs/06-permission-security.md) | The complete 5-layer security system, 23 Bash security checks |
+| 7 | [User Experience](./docs/07-user-experience.md) | Why React for terminal UI, streaming output implementation, terminal interaction details |
+| 8 | [Minimal Components](./docs/08-minimal-components.md) | The minimum modules needed for a coding agent, the evolution path from 500 lines to 500K |
+| 9 | [Hooks & Extensibility](./docs/09-hooks-extensibility.md) | 23 hook events, how to customize Claude Code's behavior without modifying source code |
+| 10 | [Multi-Agent Architecture](./docs/10-multi-agent.md) | Sub-agent, Coordinator, and Swarm — design tradeoffs of three multi-agent modes |
+| 11 | [Memory & Skills](./docs/11-memory-skills.md) | How AI "remembers" your preferences and project context, cross-session learning |
+
+## Who should read this?
+
+| You are | What you'll get |
+|---------|----------------|
+| A developer building AI agent products | A battle-tested architecture reference validated by millions of users |
+| A Claude Code user | Understanding of why it works the way it does, and how to deeply customize it with Hooks and CLAUDE.md |
+| Someone interested in AI safety | Production-grade AI security design in practice, not just theory from papers |
+| A student or AI researcher | First-hand material on large-scale engineering practice, more real than any textbook |
 
 ## Key Stats
 
@@ -89,32 +153,25 @@ graph TB
 | Source lines | 512,000+ |
 | TypeScript files | 1,884 |
 | Built-in tools | 66+ |
-| Hook event types | 23+ |
-| Built-in skills | 18+ |
-| Permission layers | 5 |
 | Compression levels | 4 |
-| Startup phases | 9 |
+| Security layers | 5 |
 
 ## Reading Recommendations
 
-**If you have 10 minutes:**
+**Only have 10 minutes?**
 → Read [Quick Start](./docs/quick-start.md)
 
-**If you want to understand core principles:**
+**Want to understand core principles?**
 → Read in order: [Agent Loop](./docs/02-agent-loop.md) → [Context Engineering](./docs/03-context-engineering.md) → [Tool System](./docs/04-tool-system.md)
 
-**If you want to build your own:**
-→ Read [Minimal Components](./docs/08-minimal-components.md), then check out [claude-code-from-scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)
+**Want to build your own AI agent?**
+→ Start with [Minimal Components](./docs/08-minimal-components.md), then check out [claude-code-from-scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)
 
-**If you care about security:**
-→ Read [Permission & Security](./docs/06-permission-security.md) + [Code Editing Strategy](./docs/05-code-editing-strategy.md)
-
-**If you want to customize Claude Code:**
+**Want to customize Claude Code?**
 → Read [Hooks & Extensibility](./docs/09-hooks-extensibility.md) + [Memory & Skills](./docs/11-memory-skills.md)
 
-## Related Projects
-
-- **[claude-code-from-scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)** — A minimal implementation & tutorial of Claude Code's core features, built from scratch
+**Care about security?**
+→ Read [Permission & Security](./docs/06-permission-security.md) + [Code Editing Strategy](./docs/05-code-editing-strategy.md)
 
 ## Contributing
 
