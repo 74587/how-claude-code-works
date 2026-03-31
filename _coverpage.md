@@ -6,5 +6,5 @@
 - 8 篇专题文档 + Mermaid 架构图
 - 覆盖 Agent 循环、上下文工程、工具系统、安全机制
 
-[开始阅读](docs/quick-start.md)
+[开始阅读](/)
 [GitHub](https://github.com/Windy3f3f3f3f/how-claude-code-works)
