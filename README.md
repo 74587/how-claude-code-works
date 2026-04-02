@@ -1,18 +1,26 @@
+<div align="center">
+
 # How Claude Code Works
 
-[![GitHub stars](https://img.shields.io/github/stars/Windy3f3f3f3f/how-claude-code-works?style=social)](https://github.com/Windy3f3f3f3f/how-claude-code-works)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![TypeScript](https://img.shields.io/badge/Source-TypeScript-3178C6?logo=typescript&logoColor=white)](https://github.com/anthropics/claude-code)
+**深入解读当前最成功的 AI 编程 Agent 的源码架构**
 
-> 深入解读当前最成功的 AI 编程 Agent 的源码架构
+[![GitHub stars](https://img.shields.io/github/stars/Windy3f3f3f3f/how-claude-code-works?style=flat-square&logo=github)](https://github.com/Windy3f3f3f3f/how-claude-code-works)
+[![GitHub forks](https://img.shields.io/github/forks/Windy3f3f3f3f/how-claude-code-works?style=flat-square&logo=github)](https://github.com/Windy3f3f3f3f/how-claude-code-works/fork)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
+[![TypeScript](https://img.shields.io/badge/Source-TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://github.com/anthropics/claude-code)
+[![Docs](https://img.shields.io/badge/Docs-12_chapters-orange?style=flat-square)](#专题深入)
 
-<p align="center">
-  <a href="https://windy3f3f3f3f.github.io/how-claude-code-works/#/"><strong>📘 在线阅读文档 →</strong></a>
-  &nbsp;&nbsp;|&nbsp;&nbsp;
-  <a href="./README_EN.md">English</a>
-</p>
+<br/>
+
+[**📘 在线阅读文档 →**](https://windy3f3f3f3f.github.io/how-claude-code-works/#/)
+&nbsp;&nbsp;|&nbsp;&nbsp;
+[English](./README_EN.md)
+
+<br/>
 
 > 🛠️ **想动手造一个？** 配套项目 **[Claude Code From Scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)** — 1300 行 TypeScript，8 章分步教程，从零构建你自己的 Claude Code
+
+</div>
 
 ---
 
@@ -24,7 +32,9 @@ Anthropic 开源（x）了这份源码。**但 50 万行代码，从哪里开始
 
 我和Claude Code加班从源码中提炼出 **12 篇专题文档**（共33.8w字符），覆盖了从核心循环到安全防护的每一个关键设计决策。不管你是想造自己的 AI Agent，还是想更深入地理解和使用 Claude Code，这里都是最短路径（应该？就算不是最短的，我也会不断更新这个项目）。
 
-<img alt="在线阅读文档网站截图" src="./assets/architecture.png" width="800" />
+<div align="center">
+  <img alt="在线阅读文档网站截图" src="./assets/architecture.png" width="800" />
+</div>
 
 ## 系统架构
 
@@ -127,12 +137,7 @@ Claude Code 支持三种多 Agent 模式：
 
 为了防止多个 Agent 同时改同一个文件产生冲突，系统用 Git Worktree 给每个 Agent 一份独立的代码副本。
 
-## 文档目录
-
-### 快速入门
-- **[10 分钟读懂 Claude Code](./docs/quick-start.md)** — 全部内容的浓缩版，适合快速了解
-
-### 专题深入
+## 专题深入
 
 | # | 文档 | 你会了解到 |
 |---|------|-----------|
@@ -192,6 +197,28 @@ Claude Code 支持三种多 Agent 模式：
 ## 致谢
 
 感谢 [LINUX DO](https://linux.do/) 社区的支持与讨论。
+
+## 更多交流
+
+<div align="center">
+
+**加入 AI Agent 工坊 交流群**
+
+<img src="./assets/qq.jpg" width="280" alt="QQ 群二维码" />
+
+QQ 群号：**1090526244**
+
+</div>
+
+## Star History
+
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Windy3f3f3f3f/how-claude-code-works&type=Date&theme=dark" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Windy3f3f3f3f/how-claude-code-works&type=Date" />
+  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Windy3f3f3f3f/how-claude-code-works&type=Date" width="600" />
+</picture>
+</div>
 
 ## 更新记录
 
