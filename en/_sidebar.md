@@ -19,6 +19,9 @@
   - [11. Permissions & Security](/en/docs/11-permission-security.md)
   - [12. User Experience Design](/en/docs/12-user-experience.md)
 
+- **Design Philosophy**
+  - [14. System Prompt Design](/en/docs/14-system-prompt-design.md)
+
 - **Build Your Own**
   - [13. Minimal Essential Components](/en/docs/13-minimal-components.md)
 

@@ -19,6 +19,9 @@
   - [11. 权限与安全](/docs/11-permission-security.md)
   - [12. 用户体验设计](/docs/12-user-experience.md)
 
+- **设计哲学**
+  - [14. 系统提示词设计](/docs/14-system-prompt-design.md)
+
 - **构建你自己的**
   - [13. 最小必要组件](/docs/13-minimal-components.md)
 
