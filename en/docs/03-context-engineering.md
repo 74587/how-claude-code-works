@@ -755,23 +755,57 @@ let taskBudgetRemaining: number | undefined = undefined
 //   taskBudgetRemaining -= finalContextTokensFromLastResponse(messages)
 ```
 
-## 3.6 Prompt Caching Strategy
+## 3.6 Prefix Caching Strategy
 
 Earlier we said context engineering feels like "dancing in chains" — the chains are prefix caching. Now let's examine the shape of those chains in detail, and how Claude Code dances gracefully within their constraints.
 
-### Why Is the Cache So Fragile?
+### Why Does Prefix Caching Matter?
 
-Let's build intuition first. Server-side prefix caching works like a **hash, not a diff** — it doesn't check "how similar is this prefix to the last one," it checks "are they exactly identical." A 100K-token prefix with even a single character changed is, as far as the cache is concerned, an entirely new prefix requiring full reprocessing of all 100K tokens.
+Every API request requires the server to compute KV Cache for the input (a fundamental operation in the transformer attention mechanism). A complete request input can be 100K-200K tokens — computing that from scratch every time would be unacceptably slow and expensive.
 
-Moreover, what constitutes the "cache key" isn't just the prompt text itself. Any of the following changes will cause cache invalidation:
+Prefix caching works by having the server remember the KV Cache results from the previous request. On the next request, if the prefix is exactly identical, it reuses the previous computation and only processes the new additions. But there's a hard constraint at the transformer architecture level: **the prefix must be byte-for-byte identical to reuse the KV Cache**. Not "close enough" — any single byte of change invalidates all KV Cache from that position onward.
 
-- **Content changes**: system prompt text, tool schema definitions
-- **Metadata changes**: cache scope, TTL (time-to-live), beta headers in the API request
-- **Ordering changes**: the arrangement of the tool array
+### The Three-Layer Cache Chain: From System Prompt to Conversation Content
 
-This means the cache has a much larger "attack surface" than most people realize. Claude Code has built **four layers of defense** against this, each addressing a different class of invalidation risk.
+Claude Code doesn't just cache the system prompt — it sets cache breakpoints across **all three levels** of the request, forming a complete cache chain:
 
-### Layer 1: System Prompt Splitting — Maximizing Cache Sharing
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Request N:                                                          │
+│                                                                      │
+│  [system ← cache_control] [tools ← cache_control] [history...       │
+│   ~~~~~~cache hit~~~~~~   ~~~~~~cache hit~~~~~~     msg1 msg2 msg3   │
+│                                                     ← cache_control  │
+│                                                                      │
+│  Request N+1:                                                        │
+│                                                                      │
+│  [system ← cache_control] [tools ← cache_control] [history...       │
+│   ~~~~~~cache hit~~~~~~   ~~~~~~cache hit~~~~~~     msg1 msg2 msg3   │
+│                                                  ~~~~~~cache hit~~~~~~│
+│                                                       msg4 msg5      │
+│                                                       ← cache_control│
+│                                                       ↑ only this    │
+│                                                         needs compute│
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**First breakpoint: system prompt**. `splitSysPromptPrefix()` marks `cache_control` at the static/dynamic boundary of the system prompt, allowing the core instruction portion to be shared across users (see "Splitting Strategy" below).
+
+**Second breakpoint: tool array**. The last regular tool is marked with `cache_control`. The server caches everything up to this point (system prompt + tool definitions). Optional server-side tools (like advisor) are placed after the breakpoint, so toggling them doesn't affect the cache.
+
+**Third breakpoint: message array**. `addCacheBreakpoints()` marks `cache_control` on the **last message**. This means all historical messages (from the previous turn and before) are within the cached prefix, and each turn only needs to process newly added messages.
+
+The three breakpoints chained together achieve **full-pipeline caching**: in a conversation that's been going for 20 turns, turn 21 only needs to process the latest user message and tool results — all the accumulated system + tools + 20 turns of history hit the cache. This is one of the core reasons Claude Code maintains low-latency responses.
+
+> **Detail: Cache protection for fire-and-forget requests**. Certain secondary requests (like background auxiliary queries) place the `cache_control` marker on the **second-to-last** message instead of the last. This way, temporary requests don't write their content into the main cache chain, avoiding pollution of subsequent normal conversation's cache prefix.
+
+> **Detail: Special handling for assistant messages**. `cache_control` is only marked on the last content block of a message, but skips `thinking` and `redacted_thinking` blocks — these blocks have unstable content, and marking them would reduce cache hit rates.
+
+### Cache Stability: Four Layers of Defense
+
+The benefits of full-pipeline caching are enormous, but it also means **the cost of cache invalidation is extremely high** — a single unexpected cache break could force 100K+ tokens of prefix to be fully recomputed. Claude Code has built four layers of defense to maintain cache stability.
+
+#### Layer 1: System Prompt Splitting — Maximizing Cache Sharing
 
 The core problem: the system prompt contains both **universally shared** content (core instructions, safety rules, tool descriptions) and **user-specific** content (CLAUDE.md references, MCP tool instructions, output style preferences). If the entire system prompt can only be cached as a single unit, every user needs their own cache — millions of users means millions of cache entries, with most of the content being completely duplicated.
 
@@ -789,7 +823,7 @@ But there's a decision tree here, because not all scenarios can use the optimal 
 | No MCP + global cache supported | **global** | not cached | **Worldwide** |
 | Fallback | org | org | Within organization |
 
-### Layer 2: Session-Level Latching — Preventing Mid-Session Flips
+#### Layer 2: Session-Level Latching — Preventing Mid-Session Flips
 
 Even with splitting done correctly, the cache can still break due to **mid-session metadata changes**. Two particularly insidious risks exist:
 
@@ -809,17 +843,15 @@ Claude Code's solution: **once a beta header is first sent, it continues to be s
 
 Both types of latching share a common reset point: **`/clear` and `/compact` commands** reset all latch states simultaneously. This makes sense — these commands inherently rebuild the conversation context, so the cache must be rebuilt anyway, and there's nothing left for the latches to protect.
 
-> **Design trade-off**: Latching sacrifices flexibility (can't disable a beta feature mid-session, can't downgrade TTL mid-session) in exchange for cache stability. Given the high cost of invalidating a 50-100K token cache, this is a worthwhile trade-off.
+> **Design trade-off**: Latching sacrifices flexibility (can't disable a beta feature mid-session, can't downgrade TTL mid-session) in exchange for cache stability. Given the high cost of invalidating a 100K+ token cache, this is a worthwhile trade-off.
 
-### Layer 3: Tool Array Cache Stability
+#### Layer 3: Tool Array and Message Array Arrangement Strategy
 
-In the tool schema array, the **last regular tool** is marked with `cache_control`, serving as the cache breakpoint — the server caches everything up to this position (system prompt + tool definitions).
+**Tool arrangement**: Optional server-side tools (like advisor) are placed **after** the `cache_control` breakpoint, so enabling or disabling `/advisor` only changes the small section after the breakpoint, without affecting the previously cached system prompts and tool definitions. MCP tools use the **deferred loading** (`defer_loading`) mechanism, not appearing in the tool array until Tool Search is invoked — complementing Layer 1's splitting strategy by minimizing cache differences caused by user-specific tools.
 
-Based on this breakpoint, Claude Code makes a clever arrangement: optional server-side tools (like advisor) are placed **after** the breakpoint. This means when users enable or disable `/advisor`, only the small section after the breakpoint changes, while the large amount of cached system prompts and tool definitions before the breakpoint remain completely unaffected.
+**Cached Microcompact's cache awareness**: As mentioned in section 3.4, Microcompact has two paths. When the cache is "warm" (not expired), it **does not directly modify message content** (which would break the entire message prefix cache). Instead, it sends `cache_edits` instructions telling the server to "delete certain tool_result blocks from the cache." This cleans up old content and frees space without requiring the client to re-upload or the server to reprocess the entire prefix — a sophisticated coordination between message-level caching and the compression mechanism.
 
-Additionally, MCP tools use the **deferred loading** (`defer_loading`) mechanism, not appearing in the tool array until Tool Search is invoked — this complements Layer 1's splitting strategy by minimizing cache differences caused by user-specific tools.
-
-### Layer 4: Cache Break Detection — The Diagnostic Safety Net
+#### Layer 4: Cache Break Detection — The Diagnostic Safety Net
 
 With the first three layers of defense, the cache *should* be stable. But "should" and "actually is" always have a gap — Claude Code has built a diagnostic system to verify these defenses are truly working.
 
@@ -835,7 +867,7 @@ When a break is detected, the system automatically attributes it to one of three
 
 This detection system forms an **improvement feedback loop**: source code comments reveal that Layer 2's latching mechanisms were developed specifically after the detection system discovered cache breaks caused by header toggling. Detection first, discover the problem, then build the defense — a positive engineering cycle.
 
-> **Summary**: The four layers each have their role — splitting determines what **can** be cached, latching ensures it **stays** cached, tool ordering **minimizes** the blast radius of changes, and detection **verifies** everything is working correctly.
+> **Summary**: Claude Code's prefix caching is a full-pipeline solution — system, tools, and messages all have cache breakpoints, chained together into a complete cache pipeline. Four layers of defense (splitting, latching, arrangement strategy, break detection) collectively ensure this cache chain's stability. The end result: no matter how many turns the conversation has reached, each request only needs to process the latest incremental content — everything accumulated before is provided for free by the KV Cache.
 
 ## 3.7 `<system-reminder>` Injection Mechanism
 
