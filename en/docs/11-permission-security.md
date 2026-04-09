@@ -483,11 +483,10 @@ This "observe first, switch later" strategy is very common in safety-critical sy
 | 5 | Shell metacharacters | Prevent metacharacter injection | Special characters hidden in parsed commands |
 | 6 | Dangerous variables | Prevent environment variable injection | `LD_PRELOAD=/evil.so cmd` |
 | 7 | Newlines | Prevent multi-line injection | Embedded newlines visually hide a second command |
-| 8 | Command substitution `$()` | Prevent command substitution | `echo $(rm -rf /)` |
+| 8 | Dangerous expansion patterns | Prevent command/process substitution | `echo $(rm -rf /)`, `<(cmd)`, `` `cmd` ``, etc. |
 | 9 | Input redirection | Prevent input hijacking | `cmd < /etc/passwd` |
 | 10 | Output redirection | Prevent output hijacking | `cmd > ~/.bashrc` overwrites config |
-| 11 | IFS injection | Prevent field separator attacks | Modifying IFS turns `ls` into `l` + `s` |
-| 12 | git commit substitution | Prevent unauthorized commits | Command substitution embedded in git commands |
+| 11 | IFS injection | Prevent IFS-based regex bypass | `cat${IFS:0:1}/etc/passwd` uses IFS expansion instead of spaces to bypass regex |
 | 12 | git commit substitution | Prevent unauthorized commits | Command substitution embedded in git commands |
 | 13 | /proc/environ | Prevent environment leakage | Reading `/proc/self/environ` to leak API keys |
 | 14 | Malformed tokens | Prevent parsing confusion | Tokens that the shellQuote library misparses |
