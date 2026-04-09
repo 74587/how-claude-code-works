@@ -7,7 +7,7 @@
 > A deep dive into the source code architecture of the most successful AI coding agent
 
 <p align="center">
-  <a href="https://windy3f3f3f3f.github.io/how-claude-code-works/#/"><strong>📘 Read Online →</strong></a>
+  <a href="https://windy3f3f3f3f.github.io/how-claude-code-works/#/en/"><strong>📘 Read Online</strong></a>
   &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="./README.md">中文</a>
 </p>

@@ -12,7 +12,7 @@
 
 <br/>
 
-[**📘 在线阅读文档 →**](https://windy3f3f3f3f.github.io/how-claude-code-works/#/)
+[**📘 在线阅读文档**](https://windy3f3f3f3f.github.io/how-claude-code-works/#/)
 &nbsp;&nbsp;|&nbsp;&nbsp;
 [English](./README_EN.md)
 
