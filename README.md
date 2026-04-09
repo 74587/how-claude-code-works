@@ -18,7 +18,7 @@
 
 <br/>
 
-> 🛠️ **想动手造一个？** 配套项目 **[Claude Code From Scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)** — ~3000 行 TypeScript，11 章分步教程，从零构建你自己的 Claude Code
+> 🛠️ **想动手造一个？** 配套项目 **[Claude Code From Scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)** — ~4000 行 TypeScript 或 Python两个版本，11 章分步教程，从零构建你自己的 Claude Code
 
 </div>
 
