@@ -184,7 +184,7 @@ Claude Code 支持三种多 Agent 模式：
 → 按顺序读 [主循环](./docs/02-agent-loop.md) → [上下文工程](./docs/03-context-engineering.md) → [工具系统](./docs/04-tool-system.md)
 
 **想自己造一个 AI Agent？**
-→ 先读 [最小必要组件](./docs/13-minimal-components.md)，然后跟着 **[claude-code-from-scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)** 的 11 章教程动手实现——~3000 行代码，每一步都对照源码讲解
+→ 先读 [最小必要组件](./docs/13-minimal-components.md)，然后跟着 **[claude-code-from-scratch](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)** 的 11 章教程动手实现——~4000 行代码，每一步都对照源码讲解
 
 **想定制 Claude Code？**
 → 读 [Hooks 与可扩展性](./docs/06-hooks-extensibility.md) + [记忆系统](./docs/08-memory-system.md) + [技能系统](./docs/09-skills-system.md)
