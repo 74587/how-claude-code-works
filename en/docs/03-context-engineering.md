@@ -10,6 +10,12 @@ This means the system must make difficult trade-offs: **which information stays 
 
 Think of the context window as a desk: the desktop space is limited, and you must keep the most important documents at hand while filing the rest into drawers. Context engineering is this "document management system" — deciding what goes on the desk (context construction), when to file old documents into drawers (compression), and how to quickly retrieve filed documents when needed (persistence and recovery).
 
+But context engineering faces an additional challenge beyond fitting information into the window. Each API request's system prompt and tool definitions alone may total **50-100K tokens**. To avoid reprocessing all of that from scratch every time, Claude Code relies on server-side **prefix caching** (KV Cache) — the server remembers previously processed prefixes, so subsequent requests only need to process the new additions, dramatically reducing latency and cost.
+
+Prefix caching, however, comes with a brutal constraint: **the prefix must be byte-for-byte identical to hit the cache**. Not "close enough" — any single byte of change — even just toggling a request header or reordering a tool — invalidates the entire prefix cache, forcing all 50-100K tokens to be reprocessed.
+
+This gives context engineering a feeling of **"dancing in chains"**: you can't freely reorder prompt sections, can't casually add or remove tool definitions, can't change request metadata mid-session... every design decision must simultaneously satisfy two goals — **give the model the best possible context** while **not breaking the cache**. Throughout this chapter, you'll see this tension repeatedly: many mechanisms that seem "over-engineered" are actually driven by cache stability concerns.
+
 The amount of engineering Claude Code puts into this area far exceeds most people's expectations. This chapter will deeply analyze its complete context management system.
 
 Key files: `src/context.ts` (190 lines), `src/utils/api.ts`, `src/services/compact/`
@@ -48,6 +54,110 @@ graph TD
     UC --> Final
     D[Conversation History messages] --> Final
 ```
+
+### Anatomy of a Complete API Request
+
+The three pillars above are somewhat abstract. Let's look at what an actual API request looks like. The Claude API request body has three top-level fields: `system` (system prompt array), `tools` (tool schema array), and `messages` (message array). Here's their complete structure:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  system — System Prompt Array (multiple TextBlocks)          │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ [0] Attribution Header                     not cached  │  │
+│  │ [1] CLI Prefix (interactive / -p mode)     not cached  │  │
+│  │ ─── Static Content ──────────────────── 🔒 global ──  │  │
+│  │ [2] Core instructions + tool descriptions + safety     │  │
+│  │     rules + behavioral guidelines                      │  │
+│  │     (identical for ALL users)                          │  │
+│  │ ─── __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ ────────────── │  │
+│  │ ─── Dynamic Content ──────────────────── not cached ── │  │
+│  │ [3] Output style, language prefs, MCP instructions     │  │
+│  │     (varies by user/session)                           │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                               │
+│  tools — Tool Schema Array                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ Built-in tools (Read, Edit, Bash, Grep, Write, Glob…) │  │
+│  │ MCP tools (user-installed, may have defer_loading)     │  │
+│  │ Last tool ← marked with cache_control as breakpoint   │  │
+│  │ ── After breakpoint ──                                 │  │
+│  │ Server-side tools (advisor etc., toggle won't bust     │  │
+│  │ cache)                                                 │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                               │
+│  messages — Message Array                                     │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ [User]  <system-reminder>                               │  │
+│  │           CLAUDE.md content + current date               │  │
+│  │           (computed once at session start)               │  │
+│  │         </system-reminder>                   (isMeta)   │  │
+│  │                                                          │  │
+│  │ [User]  User's 1st message                               │  │
+│  │ [Asst]  Model response (may contain tool_use blocks)    │  │
+│  │ [User]  tool_result                                      │  │
+│  │ [User]  Attachment messages (each a separate isMeta      │  │
+│  │         user message):                                   │  │
+│  │          ├ <system-reminder> memory files </…>           │  │
+│  │          ├ <system-reminder> available skills </…>       │  │
+│  │          ├ <system-reminder> deferred tool results </…>  │  │
+│  │          └ <system-reminder> MCP instruction delta </…>  │  │
+│  │ [Asst]  Model's 2nd response                             │  │
+│  │ …(messages keep growing until compression kicks in)      │  │
+│  └────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+A few key design decisions to note:
+
+- **Memory, skills, and MCP instructions** are NOT in the system prompt — they're injected as `<system-reminder>` attachment messages in the message array. This way they can be injected incrementally and on-demand (only when content changes), without breaking the system prompt cache
+- **CLAUDE.md and date** are "meta information" but placed in the first message (not the system prompt), because CLAUDE.md content varies by project — putting it in the system prompt would reduce cache sharing
+- The **tool schema array** has `cache_control` marked on the last tool, and the server caches everything up to that point. Optional tools like advisor are placed after the breakpoint so toggling them won't affect the cache
+
+The following table summarizes how each component behaves within a session:
+
+| Component | Location in Request | Change Frequency (in session) | Notes |
+|-----------|-------------------|-------------------------------|-------|
+| Core system instructions | `system` (before boundary) | **Never** — identical for all users | Globally cached, shared worldwide |
+| Dynamic system instructions | `system` (after boundary) | **Never** — varies by user but fixed within session | Determined at session start |
+| Tool schemas | `tools[]` | **Rarely** — only on MCP reconnect or Tool Search | Deferred loading reduces churn |
+| CLAUDE.md + date | `messages[0]` | **Never** — memoized once at session start | Wrapped in system-reminder |
+| User messages + model replies | `messages` | **Every turn** — grows with each interaction | Compression controls growth |
+| Tool calls / results | `messages` | **Every tool execution** | Old results cleaned by Microcompact |
+| Memory files | `messages` (attachments) | **On demand** — injected when relevant, deduplicated | Max 60KB per session |
+| Skills / MCP instructions | `messages` (attachments) | **Incremental** — only delta injected when list changes | No redundant resending |
+
+### How One Turn Changes the Context
+
+Now that we understand the static structure, let's see the dynamic process — what happens to the context during a single turn (Turn N):
+
+```mermaid
+flowchart TD
+    Start["Turn N begins<br/>messages = [...history]"] --> Compress
+
+    subgraph Compress ["① Compression Check (5-level pipeline)"]
+        C1["Tool Result Budget Trim"] --> C2["History Snip"]
+        C2 --> C3["Microcompact"]
+        C3 --> C4["Context Collapse"]
+        C4 --> C5["Autocompact"]
+    end
+
+    Compress --> Build["② Assemble Request<br/>system + tools + prependUserContext(messages)"]
+    Build --> Call["③ Send API Request"]
+    Call --> Stream["④ Stream assistant message<br/>(may contain tool_use)"]
+    Stream --> HasTool{"Has tool_use?"}
+    HasTool -->|No| Done["Turn N ends<br/>Wait for user input"]
+    HasTool -->|Yes| Exec["⑤ Execute tool, collect tool_result"]
+    Exec --> Attach["⑥ Collect attachment messages<br/>memory prefetch, skill delta,<br/>MCP instruction delta, etc.<br/>→ wrap as system-reminder"]
+    Attach --> Concat["⑦ Append to message array<br/>messages += [assistant, tool_result, attachments]"]
+    Concat --> Start2["→ Enter Turn N+1 (tool loop)"]
+
+    style Compress fill:#fff3e0
+    style Build fill:#e1f5fe
+    style Exec fill:#e8f5e9
+    style Attach fill:#f3e5f5
+```
+
+**Key takeaway**: The context is "alive" — with each turn, the message array grows (new assistant reply + tool_result + attachments), while compression mechanisms check and control the growth rate at the start of each turn. The system prompt and tool list remain essentially unchanged throughout the session, which is precisely why they can be efficiently cached.
 
 ## 3.2 System Prompt Construction
 
@@ -104,7 +214,7 @@ DANGEROUS_uncachedSystemPromptSection(
 
 The `DANGEROUS_` prefix is intentional code-level warning — it reminds developers: **this section is recomputed every turn, and if the value changes it will break the prompt cache**. Developers must provide a `_reason` parameter explaining why cache breaking is necessary. Most sections are stable (tool descriptions, safety rules), and only a few sections that depend on real-time feature flags need to use the `DANGEROUS_` variant.
 
-`clearSystemPromptSections()` is called during `/clear` and `/compact`, simultaneously resetting the beta header latch (see 3.6.3), giving the next conversation a completely fresh state.
+`clearSystemPromptSections()` is called during `/clear` and `/compact`, simultaneously resetting the beta header latch (see 3.6 Layer 2), giving the next conversation a completely fresh state.
 
 ### System Context (`getSystemContext`)
 
@@ -647,73 +757,85 @@ let taskBudgetRemaining: number | undefined = undefined
 
 ## 3.6 Prompt Caching Strategy
 
-Prompt caching is the core of Claude Code's performance and cost optimization. The system prompt + tool definitions for each API request may be 50-100K tokens, and processing them from scratch each time is both slow and expensive. Prompt caching lets the server remember previously processed prefixes, so subsequent requests only need to process new additions.
+Earlier we said context engineering feels like "dancing in chains" — the chains are prefix caching. Now let's examine the shape of those chains in detail, and how Claude Code dances gracefully within their constraints.
 
-But caching has a fragility: **any single byte change in the prefix causes cache invalidation** (cache miss), requiring reprocessing and re-caching the entire prefix. Claude Code carefully maintains cache stability at multiple levels.
+### Why Is the Cache So Fragile?
 
-### Three-Mode System Prompt Splitting
+Let's build intuition first. Server-side prefix caching works like a **hash, not a diff** — it doesn't check "how similar is this prefix to the last one," it checks "are they exactly identical." A 100K-token prefix with even a single character changed is, as far as the cache is concerned, an entirely new prefix requiring full reprocessing of all 100K tokens.
 
-`splitSysPromptPrefix()` (`src/utils/api.ts`) splits the system prompt into blocks with different cache scopes. Depending on the runtime environment, there are three splitting modes:
+Moreover, what constitutes the "cache key" isn't just the prompt text itself. Any of the following changes will cause cache invalidation:
 
-**Mode 1: With MCP Tools**
+- **Content changes**: system prompt text, tool schema definitions
+- **Metadata changes**: cache scope, TTL (time-to-live), beta headers in the API request
+- **Ordering changes**: the arrangement of the tool array
 
-MCP (Model Context Protocol) tool schemas vary by user — different users have different MCP servers installed. Using `scope: 'global'` caching would cause massive cache misses (different users have different tool lists). Therefore, the system sets all non-attribution-header blocks to `scope: 'org'` (shared within organization).
+This means the cache has a much larger "attack surface" than most people realize. Claude Code has built **four layers of defense** against this, each addressing a different class of invalidation risk.
 
-**Mode 2: Global Cache (1P users, no MCP)**
+### Layer 1: System Prompt Splitting — Maximizing Cache Sharing
 
-This is the optimal path. Using the `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` marker, the system prompt is split into:
-- Static content before the boundary → `scope: 'global'` (globally shared, all users hit the same cache)
-- Dynamic content after the boundary → `scope: null` (not cached)
-- Attribution header → `scope: null`
-- CLI prefix → `scope: null`
+The core problem: the system prompt contains both **universally shared** content (core instructions, safety rules, tool descriptions) and **user-specific** content (CLAUDE.md references, MCP tool instructions, output style preferences). If the entire system prompt can only be cached as a single unit, every user needs their own cache — millions of users means millions of cache entries, with most of the content being completely duplicated.
 
-**Mode 3: Default Fallback**
+The solution: `splitSysPromptPrefix()` (`src/utils/api.ts`) uses the `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` marker to split the system prompt at the **shared/specific boundary**, applying different cache strategies to each part.
 
-When the global cache feature is not enabled or the boundary marker is missing, all non-attribution-header blocks use `scope: 'org'`.
+But there's a decision tree here, because not all scenarios can use the optimal strategy:
 
-| Mode | Trigger Condition | Static Block Cache | Dynamic Block Cache |
-|------|-------------------|-------------------|-------------------|
-| MCP present | Session has MCP tools | org | org |
-| Global cache | 1P + has boundary marker | **global** | null |
-| Default | Fallback | org | org |
+1. **Does the user have MCP tools installed?** If yes, MCP tool schemas vary by user (different users install different MCP servers). Even if the system prompt text is identical, the tool arrays differ — global caching won't work. All blocks fall back to `scope: 'org'` (shared within organization).
+2. **Is global caching available and does the boundary marker exist?** If yes, this is the optimal path: static content before the boundary uses `scope: 'global'` (**shared across all users worldwide**), dynamic content after the boundary is not cached.
+3. **Neither condition met?** Everything falls back to `scope: 'org'`.
 
-### Cache TTL
+| Scenario | Static Content Cache | Dynamic Content Cache | Sharing Scope |
+|----------|---------------------|----------------------|---------------|
+| Has MCP tools | org | org | Within organization |
+| No MCP + global cache supported | **global** | not cached | **Worldwide** |
+| Fallback | org | org | Within organization |
 
-- **Default**: ephemeral (5-minute TTL) — if no new request within 5 minutes, the cache expires
-- **Eligible users**: Internal users and subscribed users (not exceeding usage limits) get **1-hour TTL**
-- Eligibility is locked at session start via `setPromptCache1hEligible()` — preventing mid-session usage changes from causing TTL flipping, cache key changes, and consequently cache invalidation
+### Layer 2: Session-Level Latching — Preventing Mid-Session Flips
 
-### Beta Header Sticky Latch
+Even with splitting done correctly, the cache can still break due to **mid-session metadata changes**. Two particularly insidious risks exist:
 
-Beta headers (such as `cache-editing`, `thinking-clear`, `fast-mode`, etc.) change the server-side cache key. If a header is sent in request A but not in request B, the cache keys differ — 50-70K tokens of cached prefix are completely invalidated.
+**Risk 1: Cache expiration time changes**
 
-To prevent this, Claude Code implements a **sticky-on latch**:
+Server-side caches have an expiration time (TTL): 5 minutes for regular users, 1 hour for internal users and paid subscribers. But the TTL itself is part of the cache key — if a user exceeds their usage quota at turn 10, and the system downgrades them from "1 hour" to "5 minutes," the cache key changes, and all previously accumulated cache is invalidated.
 
-```
-Once a beta header is first sent, it continues to appear in all subsequent requests for that session
-```
+Claude Code's solution: **lock cache eligibility at session start, never change it mid-session**. `setPromptCache1hEligible()` evaluates whether the user qualifies for 1-hour TTL on the first API call and caches the result for the rest of the session. Even if the user exceeds their quota mid-session, the TTL won't downgrade.
 
-Even if a feature flag disables the functionality mid-session, the header continues to be sent. This sacrifices a bit of flexibility (cannot disable a beta feature mid-session) in exchange for cache stability.
+**Risk 2: API request header changes**
 
-The latch resets during `/clear` and `/compact` (`clearBetaHeaderLatches()`), because these operations themselves will cause cache rebuilding.
+The Claude API supports several beta features (such as fast-mode, cache-editing, thinking-clear, etc.) enabled via HTTP request headers. These headers also affect the server's cache key — if turn 3's request includes the `fast-mode` header but turn 4 doesn't, the cache keys differ.
 
-### Tool-Level cache_control
+These features may be controlled by feature flags that can toggle server-side at any time. Imagine: a user is coding, a feature flag suddenly disables fast-mode, the next request is missing a header, and 50-70K tokens of cache are instantly invalidated.
 
-The **last tool** in the tool schema array is marked with `cache_control`, serving as the cache breakpoint. The server caches everything up to this breakpoint.
+Claude Code's solution: **once a beta header is first sent, it continues to be sent in all subsequent requests for that session** — even if the feature flag that triggered it has been turned off. The source code calls this a "sticky-on latch," applying to four headers: AFK mode, fast mode, cache editing, and thinking clear.
 
-Strategically, server-side tools (such as advisor) are placed **after** the marker. This means enabling/disabling `/advisor` only changes the small tail after the cache breakpoint, without affecting the large amount of previously cached system prompts and tool definitions.
+Both types of latching share a common reset point: **`/clear` and `/compact` commands** reset all latch states simultaneously. This makes sense — these commands inherently rebuild the conversation context, so the cache must be rebuilt anyway, and there's nothing left for the latches to protect.
 
-### Cache Break Detection
+> **Design trade-off**: Latching sacrifices flexibility (can't disable a beta feature mid-session, can't downgrade TTL mid-session) in exchange for cache stability. Given the high cost of invalidating a 50-100K token cache, this is a worthwhile trade-off.
 
-`promptCacheBreakDetection.ts` is a diagnostic system — it records snapshots before and after each API call, detecting whether the cache has unexpectedly been invalidated.
+### Layer 3: Tool Array Cache Stability
 
-Detection logic:
-- If `cache_read_input_tokens` drops by more than **5% and 2000 tokens** compared to last time, it's determined to be a cache break
-- Automatically attributes three causes:
-  - **TTL expiration**: Time since last assistant message exceeds the cache time window
-  - **Client-side change**: System prompt, tool list, beta headers, etc. have changed (compared via hash)
-  - **Server-side change**: Everything on the client side is unchanged but the cache is still invalidated — possibly server-side cache eviction
-- Break events are recorded to diagnostic logs (`tengu_prompt_cache_break`), helping developers optimize cache hit rates
+In the tool schema array, the **last regular tool** is marked with `cache_control`, serving as the cache breakpoint — the server caches everything up to this position (system prompt + tool definitions).
+
+Based on this breakpoint, Claude Code makes a clever arrangement: optional server-side tools (like advisor) are placed **after** the breakpoint. This means when users enable or disable `/advisor`, only the small section after the breakpoint changes, while the large amount of cached system prompts and tool definitions before the breakpoint remain completely unaffected.
+
+Additionally, MCP tools use the **deferred loading** (`defer_loading`) mechanism, not appearing in the tool array until Tool Search is invoked — this complements Layer 1's splitting strategy by minimizing cache differences caused by user-specific tools.
+
+### Layer 4: Cache Break Detection — The Diagnostic Safety Net
+
+With the first three layers of defense, the cache *should* be stable. But "should" and "actually is" always have a gap — Claude Code has built a diagnostic system to verify these defenses are truly working.
+
+`promptCacheBreakDetection.ts` implements a **two-phase snapshot comparison**:
+
+1. **Before API call**: Record a snapshot of all state that affects the cache key — system prompt hash, tool schema hash (per-tool granularity), beta header list, TTL settings, etc.
+2. **After API call**: Check `cache_read_input_tokens` in the response. If it dropped by more than **5% and 2000 tokens** compared to last time, it's classified as a cache break
+
+When a break is detected, the system automatically attributes it to one of three causes:
+- **TTL expiration**: Time since the last request exceeded the cache time window (user was away too long)
+- **Client-side change**: By comparing hash diffs, it pinpoints exactly which field changed (it can even identify which specific tool's schema changed)
+- **Server-side eviction**: Everything on the client side is unchanged but the cache still missed — indicating the server proactively evicted the cache
+
+This detection system forms an **improvement feedback loop**: source code comments reveal that Layer 2's latching mechanisms were developed specifically after the detection system discovered cache breaks caused by header toggling. Detection first, discover the problem, then build the defense — a positive engineering cycle.
+
+> **Summary**: The four layers each have their role — splitting determines what **can** be cached, latching ensures it **stays** cached, tool ordering **minimizes** the blast radius of changes, and detection **verifies** everything is working correctly.
 
 ## 3.7 `<system-reminder>` Injection Mechanism
 
@@ -821,7 +943,7 @@ During normal operation, autocompact should proactively trigger when context uti
 4. **Cache-aware context assembly**: The injection order of context (system prompt first, user context before messages) considers prompt cache hit rates
 5. **Anchor strategy for token estimation**: Using the precise usage reported by the server as an anchor, only estimating increments, balancing precision and latency
 6. **system-reminder as a unified injection channel**: Wrapped in XML tags, injecting system information at any position in the message flow without confusing role boundaries
-7. **Pragmatic trade-off of sticky latching**: Sacrificing mid-session switchability of beta headers in exchange for cache stability — the correct trade-off given the high cost of cache invalidation
+7. **Pragmatic trade-off of session-level latching**: Both TTL eligibility and beta headers are locked once determined, lasting until session end — sacrificing flexibility for cache stability, since the cost of invalidating 50-100K tokens of cache far outweighs the inability to toggle a feature mid-session
 
 ---
 
